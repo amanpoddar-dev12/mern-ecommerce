@@ -1,143 +1,144 @@
 import Coupon from "../models/coupon.model.js";
 import Order from "../models/order.model.js";
-import { stripe } from "../lib/stripe.js";
+// import { stripe } from "../lib/razorpay.js";
+
+import { razorpay } from "../lib/razorpay.js";
+import crypto from "crypto"; // for signature verification
+// import Coupon from "../models/coupon.model.js";
+// import Order from "../models/order.model.js";
 
 export const createCheckoutSession = async (req, res) => {
-	try {
-		const { products, couponCode } = req.body;
+  try {
+    const { products, couponCode } = req.body;
 
-		if (!Array.isArray(products) || products.length === 0) {
-			return res.status(400).json({ error: "Invalid or empty products array" });
-		}
+    if (!Array.isArray(products) || products.length === 0) {
+      return res.status(400).json({ error: "Invalid or empty products array" });
+    }
 
-		let totalAmount = 0;
+    let totalAmount = 0;
+    products.forEach((product) => {
+      totalAmount += product.price * product.quantity;
+    });
 
-		const lineItems = products.map((product) => {
-			const amount = Math.round(product.price * 100); // stripe wants u to send in the format of cents
-			totalAmount += amount * product.quantity;
+    let coupon = null;
+    if (couponCode) {
+      coupon = await Coupon.findOne({
+        code: couponCode,
+        userId: req.user._id,
+        isActive: true,
+      });
+      if (coupon) {
+        totalAmount -= (totalAmount * coupon.discountPercentage) / 100;
+      }
+    }
 
-			return {
-				price_data: {
-					currency: "usd",
-					product_data: {
-						name: product.name,
-						images: [product.image],
-					},
-					unit_amount: amount,
-				},
-				quantity: product.quantity || 1,
-			};
-		});
+    const options = {
+      amount: totalAmount * 100, // in paise
+      currency: "INR",
+      receipt: "receipt_order_" + Date.now(),
+      notes: {
+        userId: req.user._id.toString(),
+        couponCode: couponCode || "",
+        products: JSON.stringify(
+          products.map((p) => ({
+            id: p._id,
+            quantity: p.quantity,
+            price: p.price,
+          }))
+        ),
+      },
+    };
 
-		let coupon = null;
-		if (couponCode) {
-			coupon = await Coupon.findOne({ code: couponCode, userId: req.user._id, isActive: true });
-			if (coupon) {
-				totalAmount -= Math.round((totalAmount * coupon.discountPercentage) / 100);
-			}
-		}
+    const order = await razorpay.orders.create(options);
 
-		const session = await stripe.checkout.sessions.create({
-			payment_method_types: ["card"],
-			line_items: lineItems,
-			mode: "payment",
-			success_url: `${process.env.CLIENT_URL}/purchase-success?session_id={CHECKOUT_SESSION_ID}`,
-			cancel_url: `${process.env.CLIENT_URL}/purchase-cancel`,
-			discounts: coupon
-				? [
-						{
-							coupon: await createStripeCoupon(coupon.discountPercentage),
-						},
-				  ]
-				: [],
-			metadata: {
-				userId: req.user._id.toString(),
-				couponCode: couponCode || "",
-				products: JSON.stringify(
-					products.map((p) => ({
-						id: p._id,
-						quantity: p.quantity,
-						price: p.price,
-					}))
-				),
-			},
-		});
+    if (totalAmount >= 20000) {
+      await createNewCoupon(req.user._id);
+    }
 
-		if (totalAmount >= 20000) {
-			await createNewCoupon(req.user._id);
-		}
-		res.status(200).json({ id: session.id, totalAmount: totalAmount / 100 });
-	} catch (error) {
-		console.error("Error processing checkout:", error);
-		res.status(500).json({ message: "Error processing checkout", error: error.message });
-	}
+    res.status(200).json({ orderId: order.id, amount: options.amount });
+  } catch (error) {
+    console.error("Error creating Razorpay order:", error);
+    res
+      .status(500)
+      .json({ message: "Error creating Razorpay order", error: error.message });
+  }
 };
 
 export const checkoutSuccess = async (req, res) => {
-	try {
-		const { sessionId } = req.body;
-		const session = await stripe.checkout.sessions.retrieve(sessionId);
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
+      req.body;
 
-		if (session.payment_status === "paid") {
-			if (session.metadata.couponCode) {
-				await Coupon.findOneAndUpdate(
-					{
-						code: session.metadata.couponCode,
-						userId: session.metadata.userId,
-					},
-					{
-						isActive: false,
-					}
-				);
-			}
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest("hex");
 
-			// create a new Order
-			const products = JSON.parse(session.metadata.products);
-			const newOrder = new Order({
-				user: session.metadata.userId,
-				products: products.map((product) => ({
-					product: product.id,
-					quantity: product.quantity,
-					price: product.price,
-				})),
-				totalAmount: session.amount_total / 100, // convert from cents to dollars,
-				stripeSessionId: sessionId,
-			});
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ message: "Invalid signature" });
+    }
 
-			await newOrder.save();
+    // fetch order notes from Razorpay order
+    const orderData = await razorpay.orders.fetch(razorpay_order_id);
+    const products = JSON.parse(orderData.notes.products);
+    const couponCode = orderData.notes.couponCode;
+    const userId = orderData.notes.userId;
 
-			res.status(200).json({
-				success: true,
-				message: "Payment successful, order created, and coupon deactivated if used.",
-				orderId: newOrder._id,
-			});
-		}
-	} catch (error) {
-		console.error("Error processing successful checkout:", error);
-		res.status(500).json({ message: "Error processing successful checkout", error: error.message });
-	}
+    if (couponCode) {
+      await Coupon.findOneAndUpdate(
+        { code: couponCode, userId },
+        { isActive: false }
+      );
+    }
+
+    const newOrder = new Order({
+      user: userId,
+      products: products.map((product) => ({
+        product: product.id,
+        quantity: product.quantity,
+        price: product.price,
+      })),
+      totalAmount: orderData.amount / 100,
+      razorpayPaymentId: razorpay_payment_id,
+    });
+
+    await newOrder.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Payment verified and order created",
+      orderId: newOrder._id,
+    });
+  } catch (error) {
+    console.error("Error processing Razorpay checkout:", error);
+    res.status(500).json({
+      message: "Error processing Razorpay checkout",
+      error: error.message,
+    });
+  }
 };
 
 async function createStripeCoupon(discountPercentage) {
-	const coupon = await stripe.coupons.create({
-		percent_off: discountPercentage,
-		duration: "once",
-	});
+  const coupon = await stripe.coupons.create({
+    percent_off: discountPercentage,
+    duration: "once",
+  });
 
-	return coupon.id;
+  return coupon.id;
 }
 
 async function createNewCoupon(userId) {
-	await Coupon.findOneAndDelete({ userId });
+  await Coupon.findOneAndDelete({ userId });
 
-	const newCoupon = new Coupon({
-		code: "GIFT" + Math.random().toString(36).substring(2, 8).toUpperCase(),
-		discountPercentage: 10,
-		expirationDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
-		userId: userId,
-	});
+  const newCoupon = new Coupon({
+    code: "GIFT" + Math.random().toString(36).substring(2, 8).toUpperCase(),
+    discountPercentage: 10,
+    expirationDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
+    userId: userId,
+  });
 
-	await newCoupon.save();
+  await newCoupon.save();
 
-	return newCoupon;
+  return newCoupon;
 }
