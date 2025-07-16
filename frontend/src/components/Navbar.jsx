@@ -16,7 +16,7 @@ const Navbar = () => {
             to="/"
             className="text-2xl font-extrabold text-blue-700 items-center space-x-2 flex"
           >
-            E-Commerce
+            UrbanKart
           </Link>
 
           <nav className="flex flex-wrap items-center gap-4">

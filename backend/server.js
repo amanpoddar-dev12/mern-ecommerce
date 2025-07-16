@@ -20,10 +20,16 @@ const PORT = process.env.PORT || 5000;
 const __dirname = path.resolve();
 
 // ✅ Add CORS config BEFORE routes
+// app.use(
+//   cors({
+//     origin: "http://localhost:5173", // allow Vite frontend
+//     credentials: true, // allow cookies or auth headers
+//   })
+// );
 app.use(
   cors({
-    origin: "http://localhost:5173", // allow Vite frontend
-    credentials: true, // allow cookies or auth headers
+    origin: true,
+    credentials: true,
   })
 );
 
